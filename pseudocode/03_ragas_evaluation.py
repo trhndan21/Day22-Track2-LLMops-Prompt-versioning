@@ -18,38 +18,131 @@ DELIVERABLE: faithfulness ≥ 0.8 for at least one prompt version
 import os
 import sys
 import json
+import time
 import warnings
+import numpy as np
+from pathlib import Path
+from dotenv import load_dotenv
+
 warnings.filterwarnings("ignore")   # suppress RAGAS deprecation warnings
 
-from pathlib import Path
+# ── 1. Environment / imports ────────────────────────────────────────────────
+load_dotenv()
 
-# ── 1. Imports ───────────────────────────────────────────────────────────────
-# TODO: import RAGAS evaluate + dataset classes
-# from ragas import evaluate, EvaluationDataset, SingleTurnSample
+# Set LangSmith environment variables
+os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGSMITH_TRACING", "true")
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGSMITH_API_KEY", "")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGSMITH_PROJECT", "lab22_llmops")
 
-# TODO: import the 4 metric instances (NOT from ragas.metrics.collections)
-# from ragas.metrics import (
-#     faithfulness,
-#     answer_relevancy,
-#     context_recall,
-#     context_precision,
-# )
+from ragas import evaluate, EvaluationDataset, SingleTurnSample, RunConfig
+from ragas.metrics import faithfulness, answer_relevancy, context_recall, context_precision
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# TODO: import LangChain components (same as steps 1 & 2)
-# from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-# from langchain_core.prompts import ChatPromptTemplate
-# from langchain_core.output_parsers import StrOutputParser
-# from langchain_community.vectorstores import FAISS
-# from langchain_text_splitters import RecursiveCharacterTextSplitter
-# from langsmith import traceable
+import asyncio
 
-# TODO: import numpy for averaging
-# import numpy as np
+# ── 2. Groq Wrapper to handle n=1 constraint ────────────────────────────────
+class ChatGroqSafe(ChatGroq):
+    """
+    RAGAS metrics often set n > 1 for multiple generations.
+    Groq API strictly rejects n>1, and sometimes n=1 explicitly.
+    This wrapper completely removes 'n' and paces async execution.
+    """
+    @property
+    def _default_params(self):
+        params = super()._default_params
+        params.pop("n", None)
+        return params
 
+    def bind(self, **kwargs):
+        kwargs.pop("n", None)
+        return super().bind(**kwargs)
 
-# ── 2. QA pairs with ground-truth answers ───────────────────────────────────
-# Each entry has a "question" and a "reference" (ground-truth answer).
-# You need BOTH to compute context_recall.
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        kwargs.pop("n", None)
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        kwargs.pop("n", None)
+        await asyncio.sleep(2.5)  # Pace at ~24 RPM to stay under 30 RPM Free Tier limit
+        return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+class ChatGeminiSafe(ChatGoogleGenerativeAI):
+    """
+    Gemini Free Tier has 15 RPM but 1M TPM.
+    This wrapper explicitly paces requests at ~13 RPM (4.5s sleep).
+    """
+    @property
+    def _default_params(self):
+        params = super()._default_params
+        params.pop("n", None)
+        return params
+
+    def bind(self, **kwargs):
+        kwargs.pop("n", None)
+        return super().bind(**kwargs)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        kwargs.pop("n", None)
+        import time
+        time.sleep(4.5)  # Stay safely under 15 RPM limit for synchronous calls
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        kwargs.pop("n", None)
+        await asyncio.sleep(4.5)  # Stay safely under 15 RPM limit
+        return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+# ── 3. Provider Factories ───────────────────────────────────────────────────
+def get_llm(model_key="OPENAI_MODEL_NAME", default_model="gpt-4o-mini"):
+    # 1. Try Groq first (high rate limits, avoids Gemini daily quota)
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        return ChatGroqSafe(
+            model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            groq_api_key=groq_key,
+            max_retries=5,
+        )
+    # 2. Try Gemini (fallback, only 20 req/day on free tier)
+    google_key = os.getenv("GOOGLE_API_KEY")
+    if google_key:
+        return ChatGeminiSafe(
+            model=os.getenv("GOOGLE_MODEL", "gemini-2.5-flash"),
+            google_api_key=google_key,
+            max_retries=5,
+        )
+    # 3. Try Anthropic
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    if anthropic_key:
+        return ChatAnthropic(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"),
+            api_key=anthropic_key
+        )
+    # 4. Fallback to OpenAI
+    return ChatOpenAI(
+        model=os.getenv(model_key, default_model),
+        base_url=os.getenv("OPENAI_BASE_URL", None),
+    )
+
+def get_embeddings():
+    use_local = os.getenv("USE_LOCAL_EMBEDDINGS", "true").lower() == "true"
+    if use_local:
+        return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return OpenAIEmbeddings(
+        model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+        base_url=os.getenv("OPENAI_BASE_URL", None),
+    )
+
+# ── 3. QA pairs with ground-truth answers ───────────────────────────────────
+N_QUESTIONS = 10  # Reduce to avoid free-tier rate limits
+
 QA_PAIRS = [
     {"question": "What are the three main types of machine learning?",
      "reference": "The three main types of machine learning are supervised learning, unsupervised learning, and reinforcement learning."},
@@ -114,7 +207,7 @@ QA_PAIRS = [
     {"question": "What is LangChain?",
      "reference": "LangChain is an open-source framework for building LLM applications with abstractions for chains, agents, and data connections."},
     {"question": "What is LangChain Expression Language (LCEL)?",
-     "reference": "LCEL is a declarative way to compose chains using the pipe operator, supporting streaming, async, and batching."},
+     "reference": "LCEL is a declarative way to compose chains using the pipe operator, streaming, async, and batching."},
     {"question": "What is LangGraph?",
      "reference": "LangGraph extends LangChain for stateful multi-actor applications as directed graphs, supporting cycles."},
     {"question": "What memory types does LangChain support?",
@@ -153,185 +246,165 @@ QA_PAIRS = [
      "reference": "Hallucination, toxicity, bias, PII leakage, and jailbreaking attacks."},
 ]
 
+# ── 4. Prompt templates ────────────────────────────────────
+SYSTEM_V1 = (
+    "You are a helpful AI assistant. "
+    "Answer the user's question using ONLY the provided context. "
+    "Keep your answer concise (2-4 sentences). "
+    "If the context does not contain the answer, say: 'I don't have enough information.'\n\n"
+    "Context:\n{context}"
+)
+PROMPT_V1 = ChatPromptTemplate.from_messages([("system", SYSTEM_V1), ("human", "{question}")])
 
-# ── 3. Prompt templates (same as step 2) ────────────────────────────────────
-# TODO: define PROMPT_V1 and PROMPT_V2 (copy from step 2)
-# SYSTEM_V1 = "..."
-# PROMPT_V1 = ChatPromptTemplate.from_messages([("system", SYSTEM_V1), ("human", "{question}")])
-
-# SYSTEM_V2 = "..."
-# PROMPT_V2 = ChatPromptTemplate.from_messages([("system", SYSTEM_V2), ("human", "{question}")])
+SYSTEM_V2 = (
+    "You are an expert AI tutor. Provide a structured, accurate answer.\n\n"
+    "Instructions:\n"
+    "1. Read the context carefully.\n"
+    "2. Identify the key facts relevant to the question.\n"
+    "3. Write a clear, well-organized answer (3-5 sentences).\n"
+    "4. State explicitly if the context lacks sufficient information.\n\n"
+    "Context:\n{context}"
+)
+PROMPT_V2 = ChatPromptTemplate.from_messages([("system", SYSTEM_V2), ("human", "{question}")])
 
 PROMPTS = {
-    "v1": None,   # TODO: replace None with PROMPT_V1
-    "v2": None,   # TODO: replace None with PROMPT_V2
+    "v1": PROMPT_V1,
+    "v2": PROMPT_V2,
 }
 
-
-# ── 4. Build vectorstore (reuse logic from step 1) ───────────────────────────
+# ── 5. Build vectorstore ───────────────────────────
 def build_vectorstore():
-    # TODO: copy from step 1
-    pass
+    data_path = Path("data/knowledge_base.txt")
+    if not data_path.exists():
+        data_path = Path("../data/knowledge_base.txt")
+        if not data_path.exists():
+            print("Error: Knowledge base not found.")
+            return None
+    
+    embeddings = get_embeddings()
+    text = data_path.read_text()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = splitter.split_text(text)
+    return FAISS.from_texts(chunks, embeddings)
 
-
-# ── 5. Run RAG and capture outputs + contexts ────────────────────────────────
-# TODO: optionally add @traceable decorator
+# ── 6. Run RAG and capture outputs + contexts ────────────────────────────────
 def run_rag(retriever, llm, prompt, question: str) -> dict:
-    """
-    Run the RAG chain for one question.
-
-    IMPORTANT: return contexts as a LIST of strings, not a joined string!
-    RAGAS needs individual passage strings to compute context_recall.
-
-    Returns: {"answer": str, "contexts": list[str]}
-    """
-    # TODO: retrieve documents
-    # docs     = retriever.invoke(question)
-    # contexts = [doc.page_content for doc in docs]   # ← list of strings!
-    # ctx_str  = "\n\n".join(contexts)
-
-    # TODO: run the chain
-    # answer = (prompt | llm | StrOutputParser()).invoke({"context": ctx_str, "question": question})
-
-    # TODO: return both answer and contexts list
-    # return {"answer": answer, "contexts": contexts}
-
-    pass  # remove this line when done
-
+    docs = retriever.invoke(question)
+    contexts = [doc.page_content for doc in docs]
+    ctx_str = "\n\n".join(contexts)
+    
+    answer = (prompt | llm | StrOutputParser()).invoke({"context": ctx_str, "question": question})
+    return {"answer": answer, "contexts": contexts}
 
 def collect_rag_outputs(vectorstore, prompt_version: str) -> list:
-    """
-    Run all 50 QA pairs through the given prompt version.
-    Returns a list of dicts with keys: question, reference, answer, contexts.
-    """
-    # TODO: create retriever, llm, and select the right prompt
-    # retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    # llm       = ChatOpenAI(...)
-    # prompt    = PROMPTS[prompt_version]
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    llm = get_llm()
+    prompt = PROMPTS[prompt_version]
 
     results = []
-    print(f"\nRunning 50 questions with prompt {prompt_version} ...")
+    subset = QA_PAIRS[:N_QUESTIONS]
+    print(f"\nRunning {N_QUESTIONS} questions with prompt {prompt_version} ...")
 
-    for i, qa in enumerate(QA_PAIRS, 1):
-        # TODO: call run_rag() and collect results
-        # out = run_rag(retriever, llm, prompt, qa["question"])
-        # results.append({
-        #     "question":  qa["question"],
-        #     "reference": qa["reference"],
-        #     "answer":    out["answer"],
-        #     "contexts":  out["contexts"],   # must be list[str]
-        # })
-        print(f"  [{i:02d}/50] {qa['question'][:60]}")
+    for i, qa in enumerate(subset, 1):
+        out = run_rag(retriever, llm, prompt, qa["question"])
+        results.append({
+            "question":  qa["question"],
+            "reference": qa["reference"],
+            "answer":    out["answer"],
+            "contexts":  out["contexts"],
+        })
+        print(f"  [{i:02d}/{N_QUESTIONS}] {qa['question'][:60]}")
+
+        # Rate limit handling
+        if os.getenv("GROQ_API_KEY"):
+            time.sleep(2)
+        elif os.getenv("GOOGLE_API_KEY"):
+            time.sleep(20)
 
     return results
 
-
-# ── 6. Build RAGAS EvaluationDataset ────────────────────────────────────────
+# ── 7. Build RAGAS EvaluationDataset ────────────────────────────────────────
 def build_ragas_dataset(rag_results: list):
-    """
-    Convert a list of RAG result dicts into a RAGAS EvaluationDataset.
+    samples = [
+        SingleTurnSample(
+            user_input=r["question"],
+            response=r["answer"],
+            retrieved_contexts=r["contexts"],
+            reference=r["reference"],
+        )
+        for r in rag_results
+    ]
+    return EvaluationDataset(samples=samples)
 
-    Each SingleTurnSample needs:
-      user_input         → the question
-      response           → the generated answer
-      retrieved_contexts → list[str] of retrieved passages
-      reference          → the ground-truth answer
-    """
-    # TODO: build the dataset
-    # samples = [
-    #     SingleTurnSample(
-    #         user_input=r["question"],
-    #         response=r["answer"],
-    #         retrieved_contexts=r["contexts"],
-    #         reference=r["reference"],
-    #     )
-    #     for r in rag_results
-    # ]
-    # return EvaluationDataset(samples=samples)
-
-    pass  # remove this line when done
-
-
-# ── 7. Run RAGAS evaluation ──────────────────────────────────────────────────
+# ── 8. Run RAGAS evaluation ──────────────────────────────────────────────────
 def run_ragas_eval(rag_results: list, version: str) -> dict:
-    """
-    Evaluate RAG outputs with 4 RAGAS metrics.
-    Returns a dict: {metric_name: mean_score}
-    """
     print(f"\n📐 Running RAGAS evaluation for prompt {version} ...")
+    dataset = build_ragas_dataset(rag_results)
+    
+    llm_eval = get_llm() # Use configured LLM for evaluation as well
+    emb_eval = get_embeddings()
 
-    # TODO: create the EvaluationDataset
-    # dataset = build_ragas_dataset(rag_results)
+    result = evaluate(
+        dataset,
+        metrics=[faithfulness, answer_relevancy, context_recall, context_precision],
+        llm=llm_eval,
+        embeddings=emb_eval,
+        run_config=RunConfig(max_workers=1, timeout=120, max_retries=10)
+    )
 
-    # TODO: create LLM and embeddings for RAGAS to use
-    # llm_eval = ChatOpenAI(...)
-    # emb_eval = OpenAIEmbeddings(...)
+    scores = {}
+    for key in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]:
+        raw = getattr(result, key) if hasattr(result, key) else result[key]
+        scores[key] = float(np.nanmean(raw)) if isinstance(raw, list) else float(raw)
 
-    # TODO: run evaluate() — this makes many LLM calls!
-    # result = evaluate(
-    #     dataset,
-    #     metrics=[faithfulness, answer_relevancy, context_recall, context_precision],
-    #     llm=llm_eval,
-    #     embeddings=emb_eval,
-    # )
+    for k, v in scores.items():
+        star = " ⭐" if k == "faithfulness" and v >= 0.8 else ""
+        print(f"  {k:30s}: {v:.4f}{star}")
+    return scores
 
-    # TODO: extract mean scores
-    # result[metric_name] → list of floats for 50 samples → take mean
-    # scores = {}
-    # for key in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]:
-    #     raw = result[key]           # list of floats
-    #     scores[key] = float(np.mean([v for v in raw if v is not None]))
-
-    # TODO: print and return scores
-    # for k, v in scores.items():
-    #     star = " ⭐" if k == "faithfulness" and v >= 0.8 else ""
-    #     print(f"  {k:30s}: {v:.4f}{star}")
-    # return scores
-
-    pass  # remove this line when done
-
-
-# ── 8. Main ─────────────────────────────────────────────────────────────────
+# ── 9. Main ─────────────────────────────────────────────────────────────────
 def main():
     print("=" * 60)
     print("  Step 3: RAGAS Evaluation")
     print("=" * 60)
 
-    # TODO: build vectorstore
-    # vectorstore = build_vectorstore()
+    vectorstore = build_vectorstore()
+    if not vectorstore:
+        return
 
-    # TODO: collect outputs for V1 and V2
-    # v1_results = collect_rag_outputs(vectorstore, "v1")
-    # v2_results = collect_rag_outputs(vectorstore, "v2")
+    v1_results = collect_rag_outputs(vectorstore, "v1")
+    v2_results = collect_rag_outputs(vectorstore, "v2")
 
-    # TODO: run RAGAS evaluation on both
-    # v1_scores = run_ragas_eval(v1_results, "v1")
-    # v2_scores = run_ragas_eval(v2_results, "v2")
+    v1_scores = run_ragas_eval(v1_results, "v1")
+    v2_scores = run_ragas_eval(v2_results, "v2")
 
-    # TODO: print comparison table
-    # for metric in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]:
-    #     s1, s2 = v1_scores[metric], v2_scores[metric]
-    #     winner = "← V1" if s1 > s2 else "← V2"
-    #     print(f"  {metric:30s}: V1={s1:.4f}  V2={s2:.4f}  {winner}")
+    print("\n" + "=" * 40)
+    print("  COMPARISON TABLE")
+    print("=" * 40)
+    for metric in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]:
+        s1, s2 = v1_scores[metric], v2_scores[metric]
+        winner = "← V1" if s1 > s2 else "← V2"
+        print(f"  {metric:25s}: V1={s1:.4f}  V2={s2:.4f}  {winner}")
 
-    # TODO: check faithfulness target
-    # best_faith = max(v1_scores["faithfulness"], v2_scores["faithfulness"])
-    # if best_faith >= 0.8:
-    #     print(f"✅ Target met: faithfulness = {best_faith:.4f}")
-    # else:
-    #     print(f"⚠️  Below target ({best_faith:.4f}). Try adjusting chunking or prompts.")
+    best_faith = max(v1_scores["faithfulness"], v2_scores["faithfulness"])
+    if best_faith >= 0.8:
+        print(f"\n✅ Target met: faithfulness = {best_faith:.4f}")
+    else:
+        print(f"\n⚠️  Below target ({best_faith:.4f}). Try adjusting chunking or prompts.")
 
-    # TODO: save JSON report to data/ragas_report.json
-    # report = {
-    #     "prompt_v1_scores": v1_scores,
-    #     "prompt_v2_scores": v2_scores,
-    #     "target_met": best_faith >= 0.8,
-    # }
-    # Path("data/ragas_report.json").write_text(json.dumps(report, indent=2))
-    # print("💾 Saved data/ragas_report.json")
-
-    pass  # remove this line when done
-
+    report = {
+        "prompt_v1_scores": v1_scores,
+        "prompt_v2_scores": v2_scores,
+        "target_met": best_faith >= 0.8,
+    }
+    
+    data_dir = Path("data")
+    if not data_dir.exists():
+        data_dir = Path("../data")
+        
+    report_path = data_dir / "ragas_report.json"
+    report_path.write_text(json.dumps(report, indent=2))
+    print(f"💾 Saved {report_path}")
 
 if __name__ == "__main__":
     main()
